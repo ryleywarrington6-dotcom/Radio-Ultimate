@@ -421,6 +421,11 @@ class Radio:
             self.status, self.msg, self.station = "tuning", "Tuning...", ""
         threading.Thread(target=self._worker, args=(f, g, old), daemon=True).start()
 
+    def _ensure_logged(self, entry):
+        """First successful play of a dial station adds it to the logbook (lock held)."""
+        if not any(x is entry for x in self.log):
+            self.log.append(entry)
+
     def hush(self):
         """Silence the local player while the dial is being scanned (the browser
         previews take over until the knob settles)."""
@@ -449,9 +454,14 @@ class Radio:
         with self.lock:
             entry = next((e for e in self.log if abs(e["freq"] - f) <= 0.05), None)
             if not entry:
-                found = None
-            else:
-                found = (entry["name"], list(entry["urls"]))
+                d = next((x for x in self.dial if abs(x["freq"] - f) <= 0.05), None)
+                if d:   # a dial station you haven't logged yet: logged once it plays
+                    entry = {"freq": d["freq"], "name": d["name"], "urls": [d["url"]],
+                             "note": ", ".join(x for x in (d.get("state"), d.get("country")) if x),
+                             "heard": 0, "last": "", "fav": False, "secs": 0,
+                             "tags": [t.strip().lower() for t in (d.get("tags") or "").split(",")
+                                      if t.strip()][:6]}
+            found = (entry["name"], list(entry["urls"])) if entry else None
         if not entry:
             return self._set(g, "static", "Static - nothing logged on this frequency")
         name, urls = found
@@ -507,6 +517,7 @@ class Radio:
                     self.play_entry, self.play_start = entry, time.time()
                     self.status, self.msg, self.station = "playing", "via Browser Audio", name
                     if entry:
+                        self._ensure_logged(entry)
                         entry["heard"] += 1
                         entry["last"] = time.strftime("%d %b %H:%M")
                         self.save()
@@ -526,6 +537,7 @@ class Radio:
             self.play_entry, self.play_start = entry, time.time()
             self.status, self.msg, self.station = "playing", f"via {method}", name
             if entry:
+                self._ensure_logged(entry)
                 entry["heard"] += 1
                 entry["last"] = time.strftime("%d %b %H:%M")
                 self.save()
@@ -594,6 +606,7 @@ class Radio:
 
 
 radio = Radio()
+radio.dial = []     # region stations spread across the FM dial (not yet in the logbook)
 _rb_cache = {}
 _rec_cache = {}
 
@@ -763,7 +776,57 @@ def autofill_stream(q):
     return {"urls": urls[:5], "msg": ""}
 
 
+def build_dial(country, state):
+    """Spread the region's most popular stations across the FM dial. Each gets a
+    stable slot (from its name) at least 0.2 MHz from its neighbours and from your
+    logbook, so scanning past them plays them one after another."""
+    base = {"order": "votes", "reverse": "true", "hidebroken": "true"}
+    if country:
+        base["countrycode"] = country
+    batches = ([{**base, "state": state, "limit": 60}] if state else []) + [{**base, "limit": 120}]
+    rows, seen = [], set()
+    for params in batches:
+        try:
+            data = rb("stations/search", params)
+        except Exception:
+            continue
+        for s in data:
+            url = s.get("url_resolved") or s.get("url")
+            if url and (s.get("name") or "").strip() and url not in seen:
+                seen.add(url)
+                rows.append(s)
+    with radio.lock:
+        have_urls = {u for e in radio.log for u in e["urls"]}
+        have_names = {e["name"].lower() for e in radio.log}
+        taken = {int(round(e["freq"] * 10)) for e in radio.log}
+    out = []
+    for s in rows:
+        url = s.get("url_resolved") or s.get("url")
+        name = s["name"].strip()
+        if url in have_urls or name.lower() in have_names:
+            continue
+        h = 0
+        for ch in name:
+            h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+        for k in range(206):
+            slot = 875 + (h + k) % 206
+            if not ({slot - 1, slot, slot + 1} & taken):
+                taken.add(slot)
+                out.append({"freq": round(slot / 10, 1), "name": name, "url": url,
+                            "country": s.get("country", ""), "state": s.get("state", ""),
+                            "codec": s.get("codec", ""), "bitrate": s.get("bitrate", 0),
+                            "tags": ", ".join((s.get("tags") or "").split(",")[:3])})
+                break
+        if len(out) >= 100:
+            break
+    with radio.lock:
+        radio.dial = out
+    return out
+
+
 def directory_api(route, q):
+    if route == "/api/dial":
+        return build_dial((q.get("country") or "").strip(), (q.get("state") or "").strip())
     if route == "/api/geolocate":
         return geolocate_api(q)
     if route == "/api/recommend":
@@ -920,7 +983,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send("bad request", "text/plain", 400)
         with radio.lock:
             e = next((x for x in radio.log if abs(x["freq"] - f) <= 0.05), None)
-            name, urls = (e["name"], list(e["urls"])) if e else ("", [])
+            if e:
+                name, urls = e["name"], list(e["urls"])
+            else:
+                d = next((x for x in radio.dial if abs(x["freq"] - f) <= 0.05), None)
+                name, urls = (d["name"], [d["url"]]) if d else ("", [])
         resp = open_stream(name, urls) if urls else None
         if not resp:
             return self._send("no stream", "text/plain", 502)
@@ -952,7 +1019,7 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/stream":
             self._stream(q)
         elif u.path in ("/api/countries", "/api/states", "/api/directory",
-                        "/api/recommend", "/api/geolocate", "/api/autofill"):
+                        "/api/recommend", "/api/geolocate", "/api/autofill", "/api/dial"):
             try:
                 self._send(json.dumps(directory_api(u.path, q)), "application/json")
             except Exception as e:
@@ -1032,6 +1099,7 @@ td button[data-s]{background:none;border:0;font-size:19px;color:var(--brass);pad
 .recitem{display:flex;justify-content:space-between;align-items:center;gap:10px;background:#1a1208;border-bottom:1px solid #3a2a18;padding:8px 12px}
 .recitem .hint{margin:0}
 #vol{width:120px;vertical-align:middle;accent-color:var(--brass)}
+.vmark{position:absolute;bottom:0;width:2px;height:9px;background:#8a1f12;opacity:.45;transform:translateX(-50%)}
 </style></head><body><div class="radio">
 <div class="topbar">
  <h1 id="rtitle">📻 SOUTHEND &amp; ESSEX FM TUNER</h1>
@@ -1108,7 +1176,14 @@ function show(){$('freq').textContent=freq.toFixed(1);$('knob').style.transform=
 // ---- scan previews: stations near the needle are streamed into the page and
 // ---- faded in/out by distance, so you hear each one as you scroll past ----
 let prev={},maxG=0,scanning=false,scanMode=false,handT=null,scanEndT=null,deadUntil={};
-const REACH=0.6,PRELOAD=1.5,MAXPREV=6,SCAN_SETTLE=320;
+let dialList=[];
+const REACH=0.3,PRELOAD=0.8,MAXPREV=8,SCAN_SETTLE=320;
+// every station on the dial: your logbook plus the region's stations in their own slots
+function stations(){return st.log.concat(dialList.filter(d=>!st.log.some(l=>Math.abs(l.freq-d.freq)<0.05)).map(d=>({freq:d.freq,name:d.name,urls:[d.url]})))}
+function drawDial(){document.querySelectorAll('.vmark').forEach(m=>m.remove());
+ dialList.forEach(d=>{const m=document.createElement('div');m.className='vmark';m.title=d.name;m.style.left=((d.freq-MIN)/(MAX-MIN)*100)+'%';$('scale').appendChild(m)})}
+async function loadDial(){try{dialList=await jget('/api/dial?country='+encodeURIComponent($('dc').value)+'&state='+encodeURIComponent($('ds').value));drawDial();previewUpdate()}catch(e){}}
+let dialKey='';setInterval(()=>{const k=$('dc').value+'|'+$('ds').value;if(k!==dialKey){dialKey=k;loadDial()}},1500);
 function startPrev(e){
  if(Object.keys(prev).length>=MAXPREV)return null;
  const el=new Audio();el.src='/api/stream?freq='+e.freq;
@@ -1129,7 +1204,7 @@ function previewUpdate(){
  if(!ac||!scanMode)return;
  if(!scanning&&['playing','error','off'].includes(st.status)){endScan();return}
  const now=performance.now();let mx=0;
- for(const e of st.log){
+ for(const e of stations()){
   if(!e.urls||!e.urls.length||(deadUntil[e.freq]||0)>now)continue;
   const d=Math.abs(e.freq-freq);let p=prev[e.freq];
   if(!p&&d<=PRELOAD)p=startPrev(e);
@@ -1143,7 +1218,7 @@ function previewUpdate(){
  maxG=mx;hissLevel();
 }
 
-function liveLabel(){const e=st.log.find(x=>Math.abs(x.freq-freq)<=0.05);
+function liveLabel(){const e=stations().find(x=>Math.abs(x.freq-freq)<=0.05);
  $('status').textContent=e?(e.urls&&e.urls.length?'🎶 '+e.name:'〰 '+e.name+' — no stream'):'〰 static'}
 function sendTune(){
  clearTimeout(settle);settle=null;scanning=false;
@@ -1243,6 +1318,8 @@ function render(){
 function getAutoFreq(r){
  const have=st.log.find(e=>e.urls.includes(r.url)||e.name.toLowerCase()===r.name.toLowerCase());
  if(have)return {freq:have.freq,auto:false,have:true};
+ const dv=dialList.find(d=>d.url===r.url||d.name.toLowerCase()===r.name.toLowerCase());
+ if(dv&&!st.log.some(e=>Math.abs(e.freq-dv.freq)<0.05))return {freq:dv.freq,auto:false,have:false};
  const m=(r.name+' '+(r.tags||'')).match(/\b(8[7-9]|9\d|10[0-8])\.\d\b/);
  if(m){
   const g=parseFloat(m[0]);
