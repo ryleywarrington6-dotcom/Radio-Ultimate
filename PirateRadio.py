@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlencode, urlsplit, parse_qs
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # Force curl to skip certificate checks for every station. Normally leave False:
@@ -64,65 +64,106 @@ _good_method = None  # playback method that worked last time (tried first)
 _bad_until = {}      # station name -> time before which we skip re-probing
 
 
-def probe(url, insecure):
-    """Open the stream, read a first chunk, close. Returns (curl-style exit, http_code, type, error)."""
+_PLAYLIST_TYPES = {"audio/x-mpegurl", "audio/mpegurl", "application/x-mpegurl",
+                   "audio/x-scpls", "application/pls", "application/x-scpls"}
+
+
+def _playlist_url(text):
+    """First stream URL inside an .m3u/.pls playlist (None for HLS or junk)."""
+    if "#EXT-X-" in text:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("file") and "=" in line:
+            line = line.split("=", 1)[1].strip()
+        if line.lower().startswith(("http://", "https://")):
+            return line
+    return None
+
+
+def probe(url, insecure, depth=0):
+    """Open the stream and look at what really comes back. Returns
+    (curl-style exit, http_code, content_type, error, final_url). Web pages and
+    playlists are NOT audio: playlists are followed, anything else is rejected."""
     ctx = ssl.create_default_context()
     if insecure:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+    def fail(rc, msg):
+        return rc, "", "", msg, url
     try:
-        with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
-            r.read(1024)
-            return 0, str(r.status), r.headers.get("Content-Type", ""), ""
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+            head = r.read(2048)
+            ctype = r.headers.get("Content-Type", "")
+            kind = ctype.split(";")[0].strip().lower()
+            lead = head.lstrip()
+            if (kind.startswith("text/") or kind in _PLAYLIST_TYPES or lead[:1] == b"<"
+                    or lead.startswith((b"#EXTM3U", b"[playlist", b"[Playlist"))):
+                inner = _playlist_url((head + r.read(16384)).decode("utf-8", "replace"))
+                if inner and depth < 2 and inner != url:
+                    return probe(inner, insecure, depth + 1)
+                return fail(1, f"Not an audio stream (server sent {kind or 'text'})")
+            return 0, str(r.status), ctype, "", r.geturl()
     except urllib.error.HTTPError as e:
-        return 22, str(e.code), "", f"HTTP {e.code}"
+        return 22, str(e.code), "", f"HTTP {e.code}", url
     except urllib.error.URLError as e:
         why = e.reason
         if isinstance(why, ssl.SSLError):
-            return 60, "", "", str(why)
+            return fail(60, str(why))
         if isinstance(why, socket.gaierror):
-            return 6, "", "", f"Could not resolve host: {urlsplit(url).hostname}"
+            return fail(6, f"Could not resolve host: {urlsplit(url).hostname}")
         if isinstance(why, (socket.timeout, TimeoutError)):
-            return 28, "", "", "Connection timed out"
-        return 7, "", "", str(why)
+            return fail(28, "Connection timed out")
+        return fail(7, str(why))
     except ssl.SSLError as e:
-        return 60, "", "", str(e)
+        return fail(60, str(e))
     except (socket.timeout, TimeoutError):
-        return 28, "", "", "Connection timed out"
-    except http.client.BadStatusLine as e:  # old Shoutcast servers answer "ICY 200 OK"
+        return fail(28, "Connection timed out")
+    except http.client.BadStatusLine as e:      # old Shoutcast servers answer "ICY 200 OK"
         if "ICY" in str(e):
-            return 0, "200", "audio/mpeg", ""
-        return 1, "", "", str(e)
+            return 0, "200", "audio/mpeg", "", url
+        return fail(1, str(e))
     except Exception as e:
-        return 1, "", "", str(e)
+        return fail(1, str(e))
 
 
 def _check(url):
     insecure = INSECURE_SSL
-    rc, code, ctype, err = probe(url, insecure)
+    rc, code, ctype, err, final = probe(url, insecure)
     if rc in SSL_ERRORS and not insecure:
         insecure = True
-        rc, code, ctype, err = probe(url, True)
-    return url, insecure, code, ctype, err or f"HTTP {code or 'none'}"
+        rc, code, ctype, err, final = probe(url, True)
+    return final, insecure, code, ctype, err or f"HTTP {code or 'none'}"
 
 
 def resolve_stream(urls):
-    """Probe all candidate URLs in parallel; return the first that serves audio."""
-    if not urls:
-        return None
+    """Probe all candidate URLs in parallel and return the best working one.
+    List order is priority: a faster lower-ranked URL only wins if every
+    higher-ranked one has failed, or is still silent after 1.5s."""
     ex = ThreadPoolExecutor(max_workers=len(urls))
+    futs = {ex.submit(_check, u): i for i, u in enumerate(urls)}
+    pending, results, deadline = set(futs), {}, None
     try:
-        for fut in as_completed([ex.submit(_check, u) for u in urls]):
-            url, insecure, code, ctype, err = fut.result()
-            if code == "200":
-                # Reject HTML error pages that some misconfigured servers return with 200.
-                if (ctype or "").lower().startswith("text/html"):
-                    print(f"    [x] {url}\n        HTTP 200 but HTML content")
-                    continue
-                return url, insecure, ctype
-            print(f"    [x] {url}\n        {err}")
-        return None
+        while pending:
+            timeout = None if deadline is None else max(0, deadline - time.time())
+            done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+            for fut in done:
+                i = futs[fut]
+                url, insecure, code, ctype, err = fut.result()
+                if code == "200":
+                    results[i] = (url, insecure, ctype)
+                else:
+                    results[i] = None
+                    print(f"    [x] {urls[i]}\n        {err}")
+            ok = sorted(k for k, v in results.items() if v)
+            if ok and (not done or all(j in results for j in range(ok[0]))):
+                return results[ok[0]]
+            if ok and deadline is None:
+                deadline = time.time() + 1.5
+        ok = sorted(k for k, v in results.items() if v)
+        return results[ok[0]] if ok else None
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
 
@@ -159,7 +200,7 @@ def flatpak_mpv_installed():
     return r.returncode == 0
 
 
-def build_candidates(url, insecure=False):
+def build_candidates(url, insecure=False, ctype=""):
     """Return a list of (name, shell command) playback methods to try in order.
     curl fetches the stream (so -k applies to every player) and pipes it in."""
     have = shutil.which
@@ -189,7 +230,9 @@ def build_candidates(url, insecure=False):
                   f"{src} | flatpak run io.mpv.Mpv --no-video --really-quiet -"))
     if have("gst-play-1.0") and not insecure:
         c.append(("GStreamer", f'gst-play-1.0 --no-interactive {quoted_url}'))
-    c.sort(key=lambda m: m[0] != _good_method)  # last working method first (stable sort)
+    not_mp3 = any(x in (ctype or "").lower() for x in ("aac", "ogg", "mp4", "flac", "opus"))
+    # mpg123 only decodes MP3: for other formats try it last (it just makes noise/silence)
+    c.sort(key=lambda m: (not_mp3 and m[0].startswith("mpg123"), m[0] != _good_method))
     return c
 
 
@@ -309,6 +352,9 @@ class Radio:
             self.log = copy.deepcopy(DEFAULT_LOG)
         for e in self.log:
             e.setdefault("urls", [])
+            dflt = next((u for n, u in STATIONS.values() if n == e["name"]), None)
+            if dflt:   # built-in stations always try their current addresses first
+                e["urls"] = list(dflt) + [x for x in e["urls"] if x not in dflt]
             e.setdefault("note", "")
             e.setdefault("heard", 0)
             e.setdefault("last", "")
@@ -495,11 +541,11 @@ class Radio:
                     break
             url, insecure, ctype = res
             reached_url = url
-            proc, _, method = try_play(build_candidates(url, insecure),
+            proc, _, method = try_play(build_candidates(url, insecure, ctype),
                                        still_current=lambda: g == self.gen)
             if not proc and not insecure and g == self.gen:
                 insecure = True
-                proc, _, method = try_play(build_candidates(url, True),
+                proc, _, method = try_play(build_candidates(url, True, ctype),
                                            still_current=lambda: g == self.gen)
             if proc:
                 _good_url[name] = (url, insecure, ctype)
@@ -932,7 +978,7 @@ def recommend():
     return out
 
 
-def open_stream(name, urls):
+def open_stream(name, urls, _depth=0):
     """Open a station's stream from the server side (so the browser never has to
     deal with certificates/CORS). Returns an HTTP response object or None."""
     cached = _good_url.get(name)
@@ -945,11 +991,21 @@ def open_stream(name, urls):
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
             try:
-                return urllib.request.urlopen(
+                resp = urllib.request.urlopen(
                     urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
                     timeout=6, context=ctx)
             except Exception:
                 continue
+            kind = resp.headers.get_content_type()
+            if kind.startswith("text/") or kind in _PLAYLIST_TYPES:
+                inner = _playlist_url(resp.read(16384).decode("utf-8", "replace"))
+                resp.close()
+                if inner and _depth < 2:
+                    nxt = open_stream(name, [inner], _depth + 1)
+                    if nxt:
+                        return nxt
+                break          # a web page, not audio - don't try the insecure retry
+            return resp
     return None
 
 
@@ -1053,56 +1109,81 @@ class Handler(BaseHTTPRequestHandler):
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Local FM Tuner</title>
 <style>
-:root{--brass:#c9a24b;--cream:#f2e4c0;--glow:#ffb347;--green:#65d685}
+:root{color-scheme:dark;--bg:#110b06;--wood1:#4b2f1b;--wood2:#2a190e;--panel:#1a1109;--line:#4d3722;--cream:#f3e7c9;--ink:#f3e7c9;--mute:#b9a579;--brass:#d4a94f;--glow:#ffb347;--green:#65d685;--red:#e0523f}
 *{box-sizing:border-box}
-body{margin:0;background:#17100a;color:var(--cream);font:15px/1.4 system-ui,sans-serif;display:flex;justify-content:center;padding:20px}
-.radio{width:min(980px,100%);background:linear-gradient(#4a2e1a,#2b1a0e);border:3px solid #6b4526;border-radius:22px;padding:22px;box-shadow:0 20px 60px #000a}
-.topbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px}
-h1{margin:0;font-size:14px;letter-spacing:.25em;color:var(--brass)}
-.locbox{display:flex;align-items:center;gap:8px;font-size:13px;background:#1a1208;border:1px solid #5a4220;padding:4px 10px;border-radius:8px;color:#e9c987}
-h2{font-size:16px;margin:26px 0 8px;color:var(--brass)}
-.panel{display:grid;grid-template-columns:1fr 220px;gap:22px;align-items:center}
-@media(max-width:720px){.panel{grid-template-columns:1fr}}
-.window{background:#1a1208;border:3px solid var(--brass);border-radius:12px;padding:14px}
-.lcd{font:700 56px/1 ui-monospace,monospace;color:var(--glow);text-shadow:0 0 14px #ff9a1f88}
-.lcd small{font-size:18px;color:#b97a2a;margin-left:8px}
-#status{min-height:22px;margin:8px 0 12px;color:#e9c987}
-.scale{position:relative;height:70px;background:linear-gradient(#f4e6bd,#d8c28a);border-radius:6px;overflow:hidden;cursor:pointer}
+body{margin:0;min-height:100vh;display:flex;justify-content:center;padding:clamp(10px,3vw,28px);color:var(--ink);
+background:radial-gradient(1200px 600px at 50% -10%,#3a2415 0,transparent 70%),var(--bg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.radio{width:min(1040px,100%);padding:clamp(14px,3vw,26px);border-radius:26px;border:2px solid #6b4526;
+background:repeating-linear-gradient(95deg,#ffffff06 0 2px,transparent 2px 7px),linear-gradient(160deg,var(--wood1),var(--wood2));
+box-shadow:0 30px 80px #000c,inset 0 1px 0 #ffffff1a,inset 0 0 40px #0006}
+.topbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:18px}
+.brand{display:flex;align-items:center;gap:12px}
+h1{margin:0;font-size:13px;font-weight:700;letter-spacing:.28em;color:var(--brass);text-shadow:0 1px 0 #000}
+h2{font-size:17px;margin:0 0 12px;color:var(--brass);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.led{width:12px;height:12px;border-radius:50%;background:#3a2a1c;border:1px solid #000;box-shadow:inset 0 1px 2px #0008;transition:.3s}
+body[data-state=playing] .led{background:var(--green);box-shadow:0 0 10px var(--green),0 0 2px #fff8 inset}
+body[data-state=tuning] .led{background:var(--glow);box-shadow:0 0 10px var(--glow);animation:pulse 1s infinite}
+body[data-state=error] .led{background:var(--red);box-shadow:0 0 10px var(--red)}
+@keyframes pulse{50%{opacity:.35}}
+.locbox{display:flex;align-items:center;gap:8px;font-size:13px;background:var(--panel);border:1px solid var(--line);padding:5px 6px 5px 12px;border-radius:999px;color:#e9c987}
+.panel{display:grid;grid-template-columns:1fr 240px;gap:24px;align-items:center}
+@media(max-width:760px){.panel{grid-template-columns:1fr}}
+.window{background:linear-gradient(#150d07,#1d1209);border:2px solid var(--brass);border-radius:16px;padding:18px;box-shadow:inset 0 0 30px #000a,0 0 0 4px #00000055}
+.lcd{font:700 clamp(46px,9vw,68px)/1 ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;color:var(--glow);text-shadow:0 0 18px #ff9a1f99,0 0 3px #ffd08a}
+.lcd small{font-size:16px;color:#b97a2a;margin-left:10px;letter-spacing:.1em}
+#status{min-height:30px;margin:10px 0 14px;padding:5px 12px;display:inline-block;border-radius:999px;background:#ffffff0d;border:1px solid #ffffff14;color:#f0d9a0;font-size:14px;max-width:100%}
+.scale{position:relative;display:block;height:78px;border-radius:8px;overflow:hidden;cursor:pointer;border:1px solid #000;
+background:linear-gradient(#f8ecc8,#d9c288 70%,#c9ad6a);box-shadow:inset 0 3px 8px #0005,inset 0 -2px 6px #0003}
 .tick{position:absolute;top:0;width:1px;background:#5a4220}
-.lab{position:absolute;top:36px;font-size:10px;color:#3a2a12;transform:translateX(-50%)}
+.lab{position:absolute;top:36px;font-size:10px;font-weight:600;color:#3a2a12;transform:translateX(-50%)}
 .mark{position:absolute;bottom:3px;transform:translateX(-50%);font-size:9px;font-weight:700;color:#8a1f12;white-space:nowrap}
-#needle{position:absolute;top:0;bottom:0;width:2px;background:#d11;box-shadow:0 0 6px #f00}
+.vmark{position:absolute;bottom:0;width:2px;height:9px;background:#8a1f12;opacity:.45;transform:translateX(-50%)}
+#needle{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:#e5261c;box-shadow:0 0 8px #f00,0 0 2px #fff6;pointer-events:none}
+#needle::before{content:"";position:absolute;top:0;left:-4px;border:5px solid transparent;border-top-color:#e5261c}
+.ctl{display:flex;gap:10px 18px;align-items:center;margin-top:16px;font-size:13px;flex-wrap:wrap;color:var(--mute)}
+.ctl label{display:flex;align-items:center;gap:6px;cursor:pointer}
+.presets{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.presets button{border-radius:999px;padding:5px 12px;font-size:13px}
+.presets button small{opacity:.7;margin-left:4px}
+.presets button.on{background:var(--glow);color:#2a1700;border-color:var(--glow)}
 .knobwrap{text-align:center}
-#knob{width:180px;height:180px;border-radius:50%;margin:auto;position:relative;touch-action:none;cursor:grab;
-background:radial-gradient(circle at 35% 30%,#e6c46d,#8a6a22 60%,#4d3a12);border:4px solid #2a1c0a;box-shadow:0 8px 20px #000a,inset 0 0 18px #0006}
-#knob::after{content:"";position:absolute;left:50%;top:10px;width:6px;height:36px;margin-left:-3px;background:#1b120b;border-radius:3px}
-.hint{font-size:12px;color:#b8a070;margin-top:10px}
-.ctl{display:flex;gap:14px;align-items:center;margin-top:12px;font-size:13px;flex-wrap:wrap}
-button{background:#5a3a1c;color:var(--cream);border:1px solid var(--brass);border-radius:6px;padding:4px 10px;cursor:pointer}
-button:hover{background:#7a5228}
+#knob{width:clamp(150px,34vw,190px);aspect-ratio:1;border-radius:50%;margin:auto;position:relative;touch-action:none;cursor:grab;border:3px solid #1c1208;
+background:repeating-conic-gradient(#7d6126 0 3deg,#b8943f 3deg 6deg);box-shadow:0 12px 26px #000b,0 0 0 6px #00000040,inset 0 0 14px #0008}
+#knob:active{cursor:grabbing}
+#knob::before{content:"";position:absolute;inset:13%;border-radius:50%;background:radial-gradient(circle at 35% 28%,#f1d58a,#a47f2c 55%,#5a4414);box-shadow:inset 0 -6px 12px #0006,0 2px 6px #0008}
+#knob::after{content:"";position:absolute;left:50%;top:7%;width:6px;height:15%;margin-left:-3px;background:#1b120b;border-radius:3px;z-index:1}
+.hint{font-size:12px;color:var(--mute);margin-top:12px;line-height:1.4}
+button{font:inherit;font-size:13px;background:linear-gradient(#6a4524,#4f3319);color:var(--cream);border:1px solid #8a6a32;border-radius:8px;padding:5px 12px;cursor:pointer;transition:filter .15s,transform .05s}
+button:hover{filter:brightness(1.2)}button:active{transform:translateY(1px)}
+button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,#knob:focus-visible{outline:2px solid var(--glow);outline-offset:2px}
 button.logged{background:#213a24;border-color:var(--green);color:var(--green)}
-table{width:100%;border-collapse:collapse;background:#1a1208;border-radius:8px;overflow:hidden}
-th,td{padding:7px 9px;text-align:left;border-bottom:1px solid #3a2a18;font-size:14px}
-th{color:var(--brass);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
-td.f{font:700 15px ui-monospace,monospace;color:var(--glow)}
-tr.on{background:#3a2810}
-td input,.add input{background:#0e0905;color:var(--cream);border:1px solid #5a4220;border-radius:5px;padding:4px 6px;width:100%}
-.add{display:grid;grid-template-columns:100px 1fr 1.5fr 1fr auto;gap:8px;margin-top:10px}
-@media(max-width:720px){.add{grid-template-columns:1fr 1fr}}
-summary{cursor:pointer;color:var(--brass);margin-top:12px}
-.dirbar{display:grid;grid-template-columns:2fr 1.3fr 1.3fr auto;gap:8px;margin-bottom:8px}
-@media(max-width:720px){.dirbar{grid-template-columns:1fr 1fr}}
-.dirbar input,.dirbar select{background:#0e0905;color:var(--cream);border:1px solid #5a4220;border-radius:5px;padding:6px 8px;min-width:0}
+#off{border-color:#a8473a;color:#ffb8aa}
+td button[data-s]{background:none;border:0;font-size:20px;color:var(--brass);padding:0 4px}
+.tabs{display:flex;gap:4px;margin:26px 0 16px;border-bottom:1px solid var(--line)}
+.tabs button{background:none;border:0;border-bottom:3px solid transparent;border-radius:0;padding:10px 16px;font-size:14px;color:var(--mute)}
+.tabs button.on{color:var(--glow);border-bottom-color:var(--glow)}
+.tab{display:none;overflow-x:auto}.tab.on{display:block}
+table{width:100%;border-collapse:collapse;background:var(--panel);border-radius:12px;overflow:hidden;border:1px solid var(--line)}
+th,td{padding:9px 11px;text-align:left;border-bottom:1px solid #33241580;font-size:14px}
+th{color:var(--brass);font-size:11px;text-transform:uppercase;letter-spacing:.1em;background:#ffffff08}
+tbody tr:hover{background:#ffffff08}
+td.f{font:700 15px ui-monospace,Menlo,Consolas,monospace;color:var(--glow)}
+tr.on{background:#4a3014!important;box-shadow:inset 3px 0 0 var(--glow)}
+td input,.add input,.dirbar input,.dirbar select{background:#0d0804;color:var(--cream);border:1px solid var(--line);border-radius:8px;padding:7px 9px;width:100%;min-width:0;font:inherit;font-size:14px}
+.add{display:grid;grid-template-columns:110px 1fr 1.5fr auto 1fr auto;gap:8px;margin-top:12px}
+@media(max-width:760px){.add{grid-template-columns:1fr 1fr}}
+summary{cursor:pointer;color:var(--brass);margin-top:14px;font-size:14px}
+.dirbar{display:grid;grid-template-columns:2fr 1.3fr 1.3fr auto;gap:8px;margin-bottom:10px}
+@media(max-width:760px){.dirbar{grid-template-columns:1fr 1fr}}
 .tags{color:#a99468;font-size:12px;max-width:220px}
 #dir td{vertical-align:middle}
-td button[data-s]{background:none;border:0;font-size:19px;color:var(--brass);padding:0 4px}
-.recitem{display:flex;justify-content:space-between;align-items:center;gap:10px;background:#1a1208;border-bottom:1px solid #3a2a18;padding:8px 12px}
-.recitem .hint{margin:0}
-#vol{width:120px;vertical-align:middle;accent-color:var(--brass)}
-.vmark{position:absolute;bottom:0;width:2px;height:9px;background:#8a1f12;opacity:.45;transform:translateX(-50%)}
+.recitem{display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin-bottom:8px}
+.recitem .hint{margin:2px 0 0}
+#vol{width:130px;vertical-align:middle;accent-color:var(--glow)}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body><div class="radio">
 <div class="topbar">
- <h1 id="rtitle">📻 SOUTHEND &amp; ESSEX FM TUNER</h1>
+ <div class="brand"><span class="led"></span><h1 id="rtitle">📻 SOUTHEND &amp; ESSEX FM TUNER</h1></div>
  <div class="locbox">
   <span id="locstatus">📍 Detecting your location…</span>
   <button id="locbtn" title="Ask browser for your current location">📍 Locate Me</button>
@@ -1117,10 +1198,13 @@ td button[data-s]{background:none;border:0;font-size:19px;color:var(--brass);pad
    <span>🔊 <input type="range" id="vol" min="0" max="100" value="50"> <span id="volv">50%</span></span>
    <label><input type="checkbox" id="hiss" checked> Static between stations</label>
    <label><input type="checkbox" id="scanon" checked> Hear stations while scanning</label></div>
+  <div class="presets" id="presets"></div>
  </div>
  <div class="knobwrap"><div id="knob" title="Drag to tune"></div>
   <div class="hint">Drag the knob · mouse wheel · ← → keys (Shift = 1 MHz) — stations fade in as you pass them</div></div>
 </div>
+<nav class="tabs"><button class="on" data-tab="t-log">📒 Logbook</button><button data-tab="t-rec">✨ For you</button><button data-tab="t-dir">🌍 Directory</button></nav>
+<section class="tab on" id="t-log">
 <h2><span id="logtitle">📒 FM Logbook — Southend &amp; Essex</span>
  <label style="font-size:12px;font-weight:400;margin-left:12px"><input type="checkbox" id="favonly"> ★ favourites only</label></h2>
 <table id="log"><thead><tr><th>★</th><th>MHz</th><th>Station</th><th>Listened</th><th>Last heard</th><th>Notes</th><th></th></tr></thead><tbody></tbody></table>
@@ -1131,9 +1215,13 @@ td button[data-s]{background:none;border:0;font-size:19px;color:var(--brass);pad
  <button id="nauto" style="white-space:nowrap">🔍 Auto-find</button>
  <input id="nt" placeholder="Notes"><button id="na">Add</button></div></details>
 
+</section>
+<section class="tab" id="t-rec">
 <h2>✨ Recommended for you <button id="recgo" style="font-size:12px;margin-left:10px">↻ Refresh</button></h2>
 <div id="rec" class="hint">Loading…</div>
 
+</section>
+<section class="tab" id="t-dir">
 <h2>🌍 Station Directory — search every region</h2>
 <div class="dirbar"><input id="dq" placeholder="Search by name or genre…"><select id="dc"></select>
  <input id="ds" list="dsl" placeholder="Region / county (e.g. Essex)"><datalist id="dsl"></datalist><button id="dgo">Search</button></div>
@@ -1144,6 +1232,7 @@ td button[data-s]{background:none;border:0;font-size:19px;color:var(--brass);pad
 </div>
 <table id="dir"><thead><tr><th>Station</th><th>Region</th><th>Format</th><th>Tags</th><th></th></tr></thead><tbody></tbody></table>
 <button id="dmore" style="display:none;margin-top:10px">Load more</button>
+</section>
 <audio id="bplayer" style="display:none"></audio>
 </div>
 <script>
@@ -1235,7 +1324,7 @@ function arm(now){
   scanning=true;scanMode=true;tuneSent=null;clearTimeout(handT);clearTimeout(scanEndT);
   if(st.status==='playing')fetch('/api/hush',{method:'POST'}).catch(()=>{});
  }
- st.status='tuning';hissLevel();show();liveLabel();render();
+ st.status='tuning';document.body.dataset.state='tuning';hissLevel();show();liveLabel();render();
  clearTimeout(settle);
  if(scan){previewUpdate();settle=setTimeout(sendTune,SCAN_SETTLE)}
  else{settle=setTimeout(sendTune,TUNE_SETTLE);if(performance.now()-tuneLast>=TUNE_MIN)sendTune()}
@@ -1286,6 +1375,7 @@ function upd(s){
   if(s.volume!=null){$('vol').value=s.volume;$('volv').textContent=s.volume+'%'}
  }
  hissLevel();show();render();previewUpdate();
+ document.body.dataset.state=s.status;renderPresets();
 }
 
 function buildScale(){const sc=$('scale');for(let f=88;f<=108;f++){const t=document.createElement('div');t.className='tick';
@@ -1494,6 +1584,18 @@ $('dq').oninput=()=>{clearTimeout(dirTimer);dirTimer=setTimeout(()=>dirSearch(),
 $('ds').onchange=()=>dirSearch();
 $('dc').onchange=()=>{$('ds').value='';loadStates();dirSearch()};
 for(const i of ['dq','ds'])$(i).onkeydown=e=>{if(e.key==='Enter')dirSearch()};
+
+// ---- tabs + favourite presets ----
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
+ document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));
+ document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t.id===b.dataset.tab))});
+let presetKey='';
+function renderPresets(){
+ const favs=st.log.filter(e=>e.fav).sort((a,b)=>a.freq-b.freq).slice(0,8),key=JSON.stringify(favs.map(e=>[e.freq,e.name]));
+ if(key!==presetKey){presetKey=key;$('presets').innerHTML=favs.length?favs.map(e=>'<button data-pf="'+e.freq+'">★ '+esc(e.name)+' <small>'+e.freq.toFixed(1)+'</small></button>').join(''):'<span class="hint" style="margin:0">☆ Star a station in the logbook to pin it here</span>'}
+ document.querySelectorAll('#presets button').forEach(b=>b.classList.toggle('on',Math.abs(parseFloat(b.dataset.pf)-freq)<=0.05));
+}
+$('presets').addEventListener('click',e=>{const b=e.target.closest('button[data-pf]');if(b)setFreq(parseFloat(b.dataset.pf),true)});
 
 buildScale();
 show();
