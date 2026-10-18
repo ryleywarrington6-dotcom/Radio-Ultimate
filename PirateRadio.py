@@ -421,6 +421,20 @@ class Radio:
             self.status, self.msg, self.station = "tuning", "Tuning...", ""
         threading.Thread(target=self._worker, args=(f, g, old), daemon=True).start()
 
+    def hush(self):
+        """Silence the local player while the dial is being scanned (the browser
+        previews take over until the knob settles)."""
+        with self.lock:
+            if self.status != "playing":
+                return
+            self.gen += 1
+            self._bank()
+            old = self.proc
+            self.proc = None
+            self.browser_url = ""
+            self.status, self.msg, self.station = "static", "Scanning…", ""
+        stop_playback(old)
+
     def stop(self):
         with self.lock:
             self.gen += 1
@@ -855,6 +869,27 @@ def recommend():
     return out
 
 
+def open_stream(name, urls):
+    """Open a station's stream from the server side (so the browser never has to
+    deal with certificates/CORS). Returns an HTTP response object or None."""
+    cached = _good_url.get(name)
+    order = ([(cached[0], cached[1])] if cached else []) + \
+            [(u, False) for u in urls if not cached or u != cached[0]]
+    for url, insecure in order:
+        for ins in ((True,) if insecure else (False, True)):
+            ctx = ssl.create_default_context()
+            if ins:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            try:
+                return urllib.request.urlopen(
+                    urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+                    timeout=6, context=ctx)
+            except Exception:
+                continue
+    return None
+
+
 class ReusableHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
@@ -877,6 +912,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _stream(self, q):
+        """Relay a logged station's audio to the browser (used for scan previews)."""
+        try:
+            f = round(float(q.get("freq", 0)), 1)
+        except ValueError:
+            return self._send("bad request", "text/plain", 400)
+        with radio.lock:
+            e = next((x for x in radio.log if abs(x["freq"] - f) <= 0.05), None)
+            name, urls = (e["name"], list(e["urls"])) if e else ("", [])
+        resp = open_stream(name, urls) if urls else None
+        if not resp:
+            return self._send("no stream", "text/plain", 502)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", resp.headers.get("Content-Type", "audio/mpeg"))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            read = getattr(resp, "read1", resp.read)
+            while True:
+                chunk = read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except OSError:
+            pass
+        finally:
+            resp.close()
+
     def do_GET(self):
         if not self._ok():
             return self._send("forbidden", "text/plain", 403)
@@ -886,6 +949,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(PAGE, "text/html; charset=utf-8")
         elif u.path == "/api/state":
             self._send(json.dumps(radio.state()), "application/json")
+        elif u.path == "/api/stream":
+            self._stream(q)
         elif u.path in ("/api/countries", "/api/states", "/api/directory",
                         "/api/recommend", "/api/geolocate", "/api/autofill"):
             try:
@@ -906,6 +971,8 @@ class Handler(BaseHTTPRequestHandler):
                 radio.play_url(str(body["name"])[:80], str(body["url"]))
             elif self.path == "/api/volume":
                 radio.set_vol(body["level"])
+            elif self.path == "/api/hush":
+                radio.hush()
             elif self.path == "/api/stop":
                 radio.stop()
             elif self.path == "/api/log":
@@ -980,10 +1047,11 @@ td button[data-s]{background:none;border:0;font-size:19px;color:var(--brass);pad
   <div class="scale" id="scale"><div id="needle"></div></div>
   <div class="ctl"><button id="off">⏻ Off</button>
    <span>🔊 <input type="range" id="vol" min="0" max="100" value="50"> <span id="volv">50%</span></span>
-   <label><input type="checkbox" id="hiss" checked> Static between stations</label></div>
+   <label><input type="checkbox" id="hiss" checked> Static between stations</label>
+   <label><input type="checkbox" id="scanon" checked> Hear stations while scanning</label></div>
  </div>
  <div class="knobwrap"><div id="knob" title="Drag to tune"></div>
-  <div class="hint">Drag the knob · mouse wheel · ← → keys (Shift = 1 MHz)</div></div>
+  <div class="hint">Drag the knob · mouse wheel · ← → keys (Shift = 1 MHz) — stations fade in as you pass them</div></div>
 </div>
 <h2><span id="logtitle">📒 FM Logbook — Southend &amp; Essex</span>
  <label style="font-size:12px;font-weight:400;margin-left:12px"><input type="checkbox" id="favonly"> ★ favourites only</label></h2>
@@ -1034,24 +1102,70 @@ function audio(){
  const s=ac.createBufferSource();s.buffer=b;s.loop=true;
  ng=ac.createGain();ng.gain.value=0;s.connect(ng).connect(ac.destination);s.start();hissLevel();
 }
-function hissLevel(){if(ng)ng.gain.value=(st.status==='off'||st.status==='playing'||!$('hiss').checked)?0:0.035}
+function hissLevel(){if(ng)ng.gain.value=((st.status==='off'||st.status==='playing'||!$('hiss').checked)?0:0.035)*(1-maxG)}
 function show(){$('freq').textContent=freq.toFixed(1);$('knob').style.transform='rotate('+angle+'deg)';$('needle').style.left=((freq-MIN)/(MAX-MIN)*100)+'%'}
+
+// ---- scan previews: stations near the needle are streamed into the page and
+// ---- faded in/out by distance, so you hear each one as you scroll past ----
+let prev={},maxG=0,scanning=false,scanMode=false,handT=null,scanEndT=null,deadUntil={};
+const REACH=0.6,PRELOAD=1.5,MAXPREV=6,SCAN_SETTLE=320;
+function startPrev(e){
+ if(Object.keys(prev).length>=MAXPREV)return null;
+ const el=new Audio();el.src='/api/stream?freq='+e.freq;
+ const g=ac.createGain();g.gain.value=0;
+ try{ac.createMediaElementSource(el).connect(g);g.connect(ac.destination)}catch(x){return null}
+ el.onerror=()=>{deadUntil[e.freq]=performance.now()+30000;stopPrev(e.freq)};
+ el.play().catch(()=>{});
+ return prev[e.freq]={el,g,t:performance.now()};
+}
+function stopPrev(f){const p=prev[f];if(!p)return;p.el.onerror=null;p.el.pause();p.el.removeAttribute('src');p.el.load();try{p.g.disconnect()}catch(x){}delete prev[f]}
+function endScan(){
+ scanMode=false;maxG=0;clearTimeout(scanEndT);
+ for(const f in prev)prev[f].g.gain.setTargetAtTime(0,ac.currentTime,0.12);
+ clearTimeout(handT);handT=setTimeout(()=>{if(!scanMode)for(const f in prev)stopPrev(f)},700);
+ hissLevel();
+}
+function previewUpdate(){
+ if(!ac||!scanMode)return;
+ if(!scanning&&['playing','error','off'].includes(st.status)){endScan();return}
+ const now=performance.now();let mx=0;
+ for(const e of st.log){
+  if(!e.urls||!e.urls.length||(deadUntil[e.freq]||0)>now)continue;
+  const d=Math.abs(e.freq-freq);let p=prev[e.freq];
+  if(!p&&d<=PRELOAD)p=startPrev(e);
+  if(!p)continue;
+  const gn=d>=REACH?0:Math.pow(1-d/REACH,1.5);
+  if(gn>0.02)p.t=now;
+  mx=Math.max(mx,gn);
+  p.g.gain.setTargetAtTime(gn,ac.currentTime,0.05);
+ }
+ for(const f in prev)if(now-prev[f].t>6000&&Math.abs(f-freq)>PRELOAD)stopPrev(f);
+ maxG=mx;hissLevel();
+}
 
 function liveLabel(){const e=st.log.find(x=>Math.abs(x.freq-freq)<=0.05);
  $('status').textContent=e?(e.urls&&e.urls.length?'🎶 '+e.name:'〰 '+e.name+' — no stream'):'〰 static'}
 function sendTune(){
- clearTimeout(settle);settle=null;
+ clearTimeout(settle);settle=null;scanning=false;
+ if(scanMode){clearTimeout(scanEndT);scanEndT=setTimeout(endScan,8000)}
  if(tuneSent===freq)return;
  tuneSent=freq;tuneLast=performance.now();
  fetch('/api/tune',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({freq})}).then(r=>r.json()).then(upd).catch(()=>{});
 }
-function arm(){
- audio();st.status='tuning';hissLevel();show();liveLabel();render();
- clearTimeout(settle);settle=setTimeout(sendTune,TUNE_SETTLE);
- if(performance.now()-tuneLast>=TUNE_MIN)sendTune();
+function arm(now){
+ audio();
+ const scan=$('scanon').checked&&!now;
+ if(scan&&!scanning){
+  scanning=true;scanMode=true;tuneSent=null;clearTimeout(handT);clearTimeout(scanEndT);
+  if(st.status==='playing')fetch('/api/hush',{method:'POST'}).catch(()=>{});
+ }
+ st.status='tuning';hissLevel();show();liveLabel();render();
+ clearTimeout(settle);
+ if(scan){previewUpdate();settle=setTimeout(sendTune,SCAN_SETTLE)}
+ else{settle=setTimeout(sendTune,TUNE_SETTLE);if(performance.now()-tuneLast>=TUNE_MIN)sendTune()}
 }
-function setFreq(f,now){freq=clampF(f);angle=fToA(freq);arm();if(now)sendTune()}
+function setFreq(f,now){freq=clampF(f);angle=fToA(freq);arm(now);if(now)sendTune()}
 
 const ptr=e=>{const r=$('knob').getBoundingClientRect();return Math.atan2(e.clientY-(r.top+r.height/2),e.clientX-(r.left+r.width/2))*180/Math.PI};
 $('knob').onpointerdown=e=>{$('knob').setPointerCapture(e.pointerId);drag={a:ptr(e)};audio()};
@@ -1063,7 +1177,7 @@ $('scale').onclick=e=>{const r=$('scale').getBoundingClientRect();setFreq(MIN+(e
 document.onkeydown=e=>{if(inEditable())return;const s=e.shiftKey?1:0.1;
  if(e.key==='ArrowRight'||e.key==='ArrowUp'){e.preventDefault();setFreq(freq+s)}
  if(e.key==='ArrowLeft'||e.key==='ArrowDown'){e.preventDefault();setFreq(freq-s)}};
-$('off').onclick=()=>{clearTimeout(timer);clearTimeout(settle);tuneSent=null;bplayer.pause();bplayer.src='';post('/api/stop')};
+$('off').onclick=()=>{clearTimeout(timer);clearTimeout(settle);tuneSent=null;bplayer.pause();bplayer.src='';scanning=false;if(scanMode)endScan();post('/api/stop')};
 $('hiss').onchange=hissLevel;
 $('na').onclick=()=>{
  if(!$('nn').value.trim())return;
@@ -1096,7 +1210,7 @@ function upd(s){
  if(document.activeElement!==$('vol')){
   if(s.volume!=null){$('vol').value=s.volume;$('volv').textContent=s.volume+'%'}
  }
- hissLevel();show();render();
+ hissLevel();show();render();previewUpdate();
 }
 
 function buildScale(){const sc=$('scale');for(let f=88;f<=108;f++){const t=document.createElement('div');t.className='tick';
